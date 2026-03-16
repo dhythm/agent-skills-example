@@ -11,7 +11,7 @@ export type SkillDefinition = {
   description: string;
   path: string;
   scope: SkillScope;
-  content: string;
+  triggerKeywords: string[];
 };
 
 type SkillDirectory = {
@@ -80,10 +80,20 @@ async function readSkill(
   try {
     const content = await fs.readFile(skillPath, "utf8");
     const parsed = matter(content);
-    const data = parsed.data as { name?: unknown; description?: unknown };
+    const data = parsed.data as {
+      name?: unknown;
+      description?: unknown;
+      trigger_keywords?: unknown;
+    };
     const name = typeof data.name === "string" ? data.name.trim() : "";
     const description =
       typeof data.description === "string" ? data.description.trim() : "";
+    const triggerKeywords = Array.isArray(data.trigger_keywords)
+      ? data.trigger_keywords.filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
 
     if (!name || !description) {
       return null;
@@ -94,7 +104,7 @@ async function readSkill(
       description,
       path: skillPath,
       scope,
-      content,
+      triggerKeywords,
     };
   } catch (error) {
     const fsError = error as NodeJS.ErrnoException;
@@ -122,6 +132,48 @@ export function formatSkillCatalog(skills: SkillDefinition[]): string {
   lines.push("</available_skills>");
 
   return lines.join("\n");
+}
+
+export function selectRelevantSkills(
+  skills: SkillDefinition[],
+  prompt: string,
+): SkillDefinition[] {
+  const normalizedPrompt = prompt.toLowerCase();
+
+  return skills
+    .map((skill) => ({
+      skill,
+      score: scoreSkill(skill, normalizedPrompt),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name))
+    .map((entry) => entry.skill);
+}
+
+export async function loadSkillBody(skillPath: string): Promise<string> {
+  const content = await fs.readFile(skillPath, "utf8");
+  const parsed = matter(content);
+
+  return parsed.content.trim();
+}
+
+function scoreSkill(skill: SkillDefinition, normalizedPrompt: string): number {
+  let score = 0;
+
+  for (const keyword of skill.triggerKeywords) {
+    if (normalizedPrompt.includes(keyword.toLowerCase())) {
+      score += 3;
+    }
+  }
+
+  const nameTokens = skill.name.toLowerCase().split(/[\s-_]+/);
+  for (const token of nameTokens) {
+    if (token && normalizedPrompt.includes(token)) {
+      score += 1;
+    }
+  }
+
+  return score;
 }
 
 function escapeXml(value: string): string {
