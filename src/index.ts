@@ -1,16 +1,25 @@
 import { createHash } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import Anthropic, { toFile } from "@anthropic-ai/sdk";
 import type { BetaMessage, BetaSkillParams } from "@anthropic-ai/sdk/resources/beta";
+import OpenAI from "openai";
+import type { Response, Responses } from "openai/resources/responses/responses";
 
 import { loadEnvironment } from "./loadEnv";
 import { formatSkillCatalog, loadSkills, type SkillDefinition } from "./skills";
 
+const execFile = promisify(execFileCallback);
+
+type Provider = "anthropic" | "openai";
 type SkillSource = "builtin" | "local";
 
 type AppOptions = {
+  provider: Provider;
   prompt: string;
   skillSource: SkillSource;
 };
@@ -28,11 +37,17 @@ type ManifestData = {
 
 const loadedEnvFiles = loadEnvironment();
 const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514";
+const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+const openaiApiKey = process.env.OPENAI_API_KEY;
+const openaiModel = process.env.OPENAI_MODEL ?? "gpt-5.4";
 const outputDirPath = path.resolve(process.cwd(), "output");
 const manifestPath = path.resolve(process.cwd(), ".claude-skills-manifest.json");
+const openaiSkillDirPath = path.resolve(
+  process.cwd(),
+  process.env.OPENAI_SLIDES_SKILL_PATH ?? ".agents/skills/slides",
+);
 const defaultPrompt = `
-このプロジェクトが Claude Skills API を使って local skills を同期し、
+このプロジェクトが Agent Skills を使って local skills を活用し、
 PowerPoint を生成する流れを、非エンジニアにも伝わるように
 わかりやすいスライドにまとめてください。
 `.trim();
@@ -44,30 +59,61 @@ const filesApiBeta = "files-api-2025-04-14" as const;
 async function main() {
   const options = parseAppOptions(process.argv.slice(2));
 
-  if (!anthropicApiKey) {
+  if (options.provider === "anthropic" && !anthropicApiKey) {
     console.warn("ANTHROPIC_API_KEY is not set.");
+  }
+  if (options.provider === "openai" && !openaiApiKey) {
+    console.warn("OPENAI_API_KEY is not set.");
   }
 
   const allSkills = await loadSkills();
-  const pptxSkill = allSkills.find(
-    (skill) => skill.scope === "project" && skill.name === "pptx",
-  );
+  const pptxSkill = allSkills.find((skill) => skill.scope === "project" && skill.name === "pptx");
+  const slidesSkill = allSkills.find((skill) => skill.scope === "project" && skill.name === "slides");
 
   console.log(
     `Environment loaded from: ${
       loadedEnvFiles.length > 0 ? loadedEnvFiles.join(", ") : "no env files"
     }`,
   );
-  console.log(`Anthropic client: ${anthropicApiKey ? "ready" : "not configured"}`);
-  console.log(`Model: ${anthropicModel}`);
+  console.log(`Provider: ${options.provider}`);
+  console.log(
+    `Anthropic client: ${anthropicApiKey ? "ready" : "not configured"}`,
+  );
+  console.log(`OpenAI client: ${openaiApiKey ? "ready" : "not configured"}`);
+  console.log(`Model: ${options.provider === "anthropic" ? anthropicModel : openaiModel}`);
   console.log(`Skill source: ${options.skillSource}`);
   console.log(`Loaded skills: ${allSkills.length}`);
   console.log(formatSkillCatalog(allSkills));
   console.log("\nSample user prompt:");
   console.log(options.prompt);
 
+  if (options.provider === "anthropic") {
+    await runAnthropicFlow({
+      prompt: options.prompt,
+      pptxSkill,
+      skillSource: options.skillSource,
+    });
+    return;
+  }
+
+  await runOpenAiFlow({
+    prompt: options.prompt,
+    slidesSkill,
+    skillSource: options.skillSource,
+  });
+}
+
+async function runAnthropicFlow({
+  prompt,
+  pptxSkill,
+  skillSource,
+}: {
+  prompt: string;
+  pptxSkill?: SkillDefinition;
+  skillSource: SkillSource;
+}) {
   if (!anthropicApiKey) {
-    console.log("\nANTHROPIC_API_KEY が未設定のため、Claude Skills 実行はスキップしました。");
+    console.log("\nANTHROPIC_API_KEY が未設定のため、Claude 実行はスキップしました。");
     return;
   }
 
@@ -76,20 +122,21 @@ async function main() {
   }
 
   const client = new Anthropic({ apiKey: anthropicApiKey });
-  const skillConfig = await resolveSkillConfig(client, pptxSkill, options.skillSource);
+  const skillConfig = await resolveSkillConfig(client, pptxSkill, skillSource);
 
-  console.log(`\nUsing Claude ${options.skillSource === "builtin" ? "built-in" : "local custom"} skill:`);
+  console.log(`\nUsing Claude ${skillSource === "builtin" ? "built-in" : "local custom"} skill:`);
   console.log(`- ${pptxSkill.name}`);
-  if (options.skillSource === "local") {
+  if (skillSource === "local") {
     console.log("- local skill directory is uploaded as a custom skill version");
   }
 
-  const response = await runUntilPptxGenerated(client, options.prompt, skillConfig);
+  const response = await runUntilPptxGenerated(client, prompt, skillConfig);
   const downloadedFiles = await downloadGeneratedFiles(client, response);
   const responseText = extractTextResponse(response);
 
   console.log("\nRun summary:");
-  console.log(`- Requested skill source: ${options.skillSource}`);
+  console.log(`- Requested provider: anthropic`);
+  console.log(`- Requested skill source: ${skillSource}`);
   console.log(`- Requested Claude skill: ${skillConfig.skill.skill_id}@${skillConfig.skill.version ?? "latest"}`);
   if (skillConfig.syncedVersion) {
     console.log(`- Synced local custom skill version: ${skillConfig.syncedVersion}`);
@@ -105,6 +152,63 @@ async function main() {
   console.log("- 期待される状態: output 配下に .pptx が生成され、ここに要約が表示されれば成功です");
   console.log("\nClaude summary:");
   console.log(responseText || "(text summary not returned)");
+}
+
+async function runOpenAiFlow({
+  prompt,
+  slidesSkill,
+  skillSource,
+}: {
+  prompt: string;
+  slidesSkill?: SkillDefinition;
+  skillSource: SkillSource;
+}) {
+  if (!openaiApiKey) {
+    console.log("\nOPENAI_API_KEY が未設定のため、OpenAI 実行はスキップしました。");
+    return;
+  }
+
+  if (skillSource !== "local") {
+    throw new Error("OpenAI では現在 `--skill-source=local` のみサポートしています。");
+  }
+
+  if (!slidesSkill) {
+    throw new Error(
+      `project scope の \`slides\` skill が見つかりませんでした。期待パス: ${openaiSkillDirPath}`,
+    );
+  }
+
+  const client = new OpenAI({ apiKey: openaiApiKey });
+  const inlineSkill = await buildOpenAiInlineSkill(slidesSkill);
+
+  console.log("\nUsing OpenAI local skill:");
+  console.log(`- ${slidesSkill.name}`);
+  console.log(`- ${slidesSkill.path}`);
+  console.log("- local skill directory is attached as an inline skill bundle");
+
+  const response = await runUntilOpenAiDeckGenerated(client, prompt, inlineSkill);
+  const downloadedFiles = await downloadOpenAiGeneratedFiles(client, response);
+  const shellOutputs = extractOpenAiShellOutputs(response);
+
+  console.log("\nRun summary:");
+  console.log("- Requested provider: openai");
+  console.log(`- Requested skill source: ${skillSource}`);
+  console.log(`- Model: ${openaiModel}`);
+  if (downloadedFiles.length === 0) {
+    console.log(`- response status: ${response.status}`);
+    console.log(`- output item types: ${response.output.map((item) => item.type).join(", ")}`);
+    if (shellOutputs) {
+      console.log("- shell output:");
+      console.log(shellOutputs);
+    }
+    throw new Error(
+      "OpenAI の応答から PowerPoint ファイルを取得できませんでした。shell 実行結果を確認してください。",
+    );
+  }
+  console.log(`- Downloaded files: ${downloadedFiles.join(", ")}`);
+  console.log("- 期待される状態: output 配下に .pptx と .js が生成されれば成功です");
+  console.log("\nOpenAI summary:");
+  console.log(response.output_text?.trim() || "(text summary not returned)");
 }
 
 async function resolveSkillConfig(
@@ -402,6 +506,143 @@ async function runUntilPptxGenerated(
   return response;
 }
 
+async function buildOpenAiInlineSkill(skill: SkillDefinition): Promise<Responses.InlineSkill> {
+  const skillDir = path.dirname(skill.path);
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openai-skill-"));
+  const zipPath = path.join(tempDir, `${skill.name}.zip`);
+
+  try {
+    await execFile("zip", ["-rq", zipPath, "."], { cwd: skillDir });
+    const bundle = await fs.readFile(zipPath);
+
+    return {
+      type: "inline",
+      name: skill.name,
+      description: skill.description,
+      source: {
+        type: "base64",
+        media_type: "application/zip",
+        data: bundle.toString("base64"),
+      },
+    };
+  } catch (error) {
+    throw new Error(
+      `OpenAI 用スキルの zip 化に失敗しました。zip コマンドが利用可能か確認してください。${error instanceof Error ? ` (${error.message})` : ""}`,
+    );
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function runUntilOpenAiDeckGenerated(
+  client: OpenAI,
+  userPrompt: string,
+  skill: Responses.InlineSkill,
+): Promise<Response> {
+  return client.responses.create({
+    model: openaiModel,
+    max_output_tokens: 4096,
+    input: [
+      {
+        role: "system",
+        content: [
+          "You must use the configured slides skill and the shell tool to generate a real PowerPoint file.",
+          "Do not stop at an outline or draft.",
+          "Your task is incomplete unless the final artifacts include at least one .pptx file and the authoring .js file.",
+          "Save final artifacts under /mnt/data so they can be downloaded after the run.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: buildOpenAiSlidePrompt(userPrompt),
+      },
+    ],
+    tools: [
+      {
+        type: "shell",
+        environment: {
+          type: "container_auto",
+          skills: [skill],
+        },
+      },
+    ],
+  });
+}
+
+async function downloadOpenAiGeneratedFiles(
+  client: OpenAI,
+  response: Response,
+): Promise<string[]> {
+  await fs.mkdir(outputDirPath, { recursive: true });
+  const containerIds = extractOpenAiContainerIds(response);
+  const downloadedPaths: string[] = [];
+
+  for (const containerId of containerIds) {
+    const files = await client.containers.files.list(containerId, { order: "asc" });
+
+    for await (const file of files) {
+      const normalizedPath = file.path.toLowerCase();
+      const shouldDownload =
+        normalizedPath.endsWith(".pptx") ||
+        normalizedPath.endsWith(".js") ||
+        normalizedPath.endsWith(".png");
+
+      if (!shouldDownload) {
+        continue;
+      }
+
+      const fileName = path.basename(file.path);
+      const localPath = path.join(outputDirPath, fileName);
+      const content = await client.containers.files.content.retrieve(file.id, {
+        container_id: containerId,
+      });
+      const arrayBuffer = await content.arrayBuffer();
+
+      await fs.writeFile(localPath, Buffer.from(arrayBuffer));
+      downloadedPaths.push(localPath);
+    }
+  }
+
+  return downloadedPaths;
+}
+
+function extractOpenAiContainerIds(response: Response): string[] {
+  const containerIds = new Set<string>();
+
+  for (const item of response.output) {
+    if (item.type !== "shell_call") {
+      continue;
+    }
+
+    if (item.environment?.type === "container_reference") {
+      containerIds.add(item.environment.container_id);
+    }
+  }
+
+  return [...containerIds.values()];
+}
+
+function extractOpenAiShellOutputs(response: Response): string {
+  return response.output
+    .filter(
+      (item): item is Responses.ResponseFunctionShellToolCallOutput =>
+        item.type === "shell_call_output",
+    )
+    .flatMap((item) =>
+      item.output.map((chunk, index) =>
+        [
+          `chunk ${index + 1}:`,
+          chunk.stdout.trim(),
+          chunk.stderr.trim() ? `stderr:\n${chunk.stderr.trim()}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      ),
+    )
+    .join("\n\n")
+    .trim();
+}
+
 function extractTextResponse(response: BetaMessage) {
   return response.content
     .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
@@ -430,6 +671,30 @@ function buildSlidePrompt(userPrompt: string, skillType: BetaSkillParams["type"]
     "- code execution により .pptx を生成すること",
     "- 生成された .pptx を output/ に保存すること",
     "対象読者は非エンジニアなので、専門用語は短く説明してください。",
+    "スライドは 5 から 8 枚程度にしてください。",
+    "",
+    "依頼:",
+    userPrompt,
+  ].join("\n");
+}
+
+function buildOpenAiSlidePrompt(userPrompt: string): string {
+  return [
+    "以下の依頼に対して、slides skill と shell を使って .pptx ファイルを作成してください。",
+    "最終的な成果物は PowerPoint ファイルそのものです。",
+    "テキストだけで終わらず、必ず .pptx を生成してください。",
+    "生成した PowerPoint の authoring source となる .js も必ず保存してください。",
+    "最終成果物は `/mnt/data/openai-skills-deck.pptx` と `/mnt/data/openai-skills-deck.js` に保存してください。",
+    "可能なら確認用のレンダリング画像も `/mnt/data/rendered/` に出力してください。",
+    "非エンジニアにも伝わる、見やすく実務的なスライドにしてください。",
+    "今回の題材は営業資料ではありません。このリポジトリの仕組み説明資料です。",
+    "OpenAI と Claude の両対応を前提にしたリポジトリであることを明確にしてください。",
+    "スライド内容は必ず以下の要素を含めてください。",
+    "- Claude では Skills API を使うこと",
+    "- OpenAI では shell tool に skill を与えて実行すること",
+    "- local skills を project 内に置いていること",
+    "- provider を切り替えて実行できること",
+    "- 生成された .pptx を output/ に保存すること",
     "スライドは 5 から 8 枚程度にしてください。",
     "",
     "依頼:",
@@ -469,10 +734,27 @@ function extractFileIds(response: BetaMessage): string[] {
 
 function parseAppOptions(argv: string[]): AppOptions {
   const promptTokens: string[] = [];
+  let provider = normalizeProvider(process.env.MODEL_PROVIDER);
   let skillSource = normalizeSkillSource(process.env.CLAUDE_PPTX_SKILL_SOURCE);
 
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
+
+    if (value === "--provider") {
+      const nextValue = argv[index + 1];
+      if (!nextValue) {
+        throw new Error("`--provider` には `anthropic` または `openai` を指定してください。");
+      }
+      provider = normalizeProvider(nextValue);
+      index += 1;
+      continue;
+    }
+
+    if (value.startsWith("--provider=")) {
+      const [, providerValue = ""] = value.split("=", 2);
+      provider = normalizeProvider(providerValue);
+      continue;
+    }
 
     if (value === "--skill-source" || value === "--mode") {
       const nextValue = argv[index + 1];
@@ -494,9 +776,22 @@ function parseAppOptions(argv: string[]): AppOptions {
   }
 
   return {
+    provider,
     prompt: (promptTokens.join(" ") || defaultPrompt).trim(),
-    skillSource,
+    skillSource: provider === "openai" ? "local" : skillSource,
   };
+}
+
+function normalizeProvider(value?: string): Provider {
+  if (!value || value.trim() === "") {
+    return "anthropic";
+  }
+
+  if (value === "anthropic" || value === "openai") {
+    return value;
+  }
+
+  throw new Error("MODEL_PROVIDER には `anthropic` または `openai` を指定してください。");
 }
 
 function normalizeSkillSource(value?: string): SkillSource {

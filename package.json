@@ -8,9 +8,11 @@
     "dev": "tsx src/index.ts",
     "dev:builtin": "tsx src/index.ts --skill-source=builtin",
     "dev:local": "tsx src/index.ts --skill-source=local",
+    "dev:openai": "tsx src/index.ts --provider=openai",
     "start": "node dist/index.js",
     "start:builtin": "node dist/index.js --skill-source=builtin",
     "start:local": "node dist/index.js --skill-source=local",
+    "start:openai": "node dist/index.js --provider=openai",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -20,7 +22,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "dotenv": "^17.3.1",
-    "gray-matter": "^4.0.3"
+    "gray-matter": "^4.0.3",
+    "openai": "^6.29.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
