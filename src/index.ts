@@ -425,7 +425,7 @@ async function runUntilPptxGenerated(
 
   let response = await client.beta.messages.create({
     model: anthropicModel,
-    max_tokens: 4096,
+    max_tokens: 8192,
     stream: false,
     betas: [codeExecutionBeta, skillsBeta, filesApiBeta],
     tool_choice: {
@@ -457,16 +457,56 @@ async function runUntilPptxGenerated(
     ],
   });
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 6; attempt += 1) {
     if (extractFileIds(response).length > 0) {
       return response;
     }
 
-    if (response.stop_reason !== "max_tokens" || !response.container?.id) {
+    if (!response.container?.id) {
       return response;
     }
 
     container = response.container.id;
+
+    if (response.stop_reason === "max_tokens") {
+      response = await client.beta.messages.create({
+        model: anthropicModel,
+        max_tokens: 8192,
+        stream: false,
+        betas: [codeExecutionBeta, skillsBeta, filesApiBeta],
+        tool_choice: {
+          type: "any",
+          disable_parallel_tool_use: true,
+        },
+        tools: [
+          {
+            name: "code_execution",
+            type: "code_execution_20250825",
+          },
+        ],
+        container,
+        system: [
+          {
+            type: "text",
+            text: [
+              "Continue from the current container state.",
+              "Finish the PowerPoint and include the generated .pptx file in the final response.",
+              "If the file has already been created in the container, attach it now instead of redoing work.",
+              "Do not restart from scratch.",
+            ].join(" "),
+          },
+        ],
+        messages: [
+          {
+            role: "user",
+            content:
+              "続けてください。必ず `.pptx` ファイルを生成し、最終レスポンスに添付してください。",
+          },
+        ],
+      });
+      continue;
+    }
+
     response = await client.beta.messages.create({
       model: anthropicModel,
       max_tokens: 4096,
@@ -487,17 +527,21 @@ async function runUntilPptxGenerated(
         {
           type: "text",
           text: [
-            "Continue from the current container state.",
-            "Finish the PowerPoint and include the generated .pptx file in the final response.",
-            "Do not restart from scratch.",
+            "Use the existing container state.",
+            "Do not recreate the deck if it already exists.",
+            "Your only remaining task is to attach the generated .pptx file to the final response.",
           ].join(" "),
         },
       ],
       messages: [
         {
           role: "user",
-          content:
-            "続けてください。必ず `.pptx` ファイルを生成し、最終レスポンスに添付してください。",
+          content: [
+            "作業済みの container を確認してください。",
+            "もし `.pptx` が既に生成済みなら、そのファイルを最終レスポンスに添付してください。",
+            "未生成なら生成して添付してください。",
+            "テキスト説明だけで終了してはいけません。",
+          ].join(" "),
         },
       ],
     });
