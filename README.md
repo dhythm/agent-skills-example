@@ -10,8 +10,8 @@ cp .env.example .env.local
 `.env.local` に以下を設定してください。
 
 ```env
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_MODEL=gpt-5-mini
+ANTHROPIC_API_KEY=your_anthropic_api_key
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
 ```
 
 `.env` も読めますが、`.env.local` が優先されます。
@@ -25,9 +25,14 @@ OPENAI_MODEL=gpt-5-mini
 
 各スキルディレクトリにある `SKILL.md` を読み込み、YAML frontmatter の `name` と `description` をカタログ化します。名前が重複した場合は、プロジェクト側のスキルを優先します。
 
-`src/index.ts` は `@openai/agents` を使って、各 skill を specialist agent として登録します。manager agent はそれらを `agent.asTool()` で必要なときだけ呼びます。
+`src/index.ts` は Claude 公式 Skills API を使って動きます。
 
-各 skill の `description` は manager に見えますが、`SKILL.md` 本文は specialist agent が呼ばれたときにだけ読み込まれます。つまり、Claude Code や Codex のような「必要な skill だけ使う」挙動を、Agents SDK の `tools` で近い形に再現しています。
+1. プロジェクト内の PowerPoint 用 local skill を custom skill として Anthropic に同期する
+2. `beta.messages.create()` で `container.skills` に同期済み skill を指定する
+3. `code_execution_20250825` ツールを有効にし、Claude に skill を使わせる
+4. Claude の応答を PowerPoint 用の JSON として受け取り、`.pptx` を生成する
+
+同期結果は [`.claude-skills-manifest.json`](/Users/yuta.okada/local/dev/agent-skills-example/.claude-skills-manifest.json) に保存されます。このファイルは Git 管理対象外です。
 
 ## 実行
 
@@ -49,6 +54,6 @@ npm run dev -- "README と env の扱いを整理して"
 npm run build
 ```
 
-起動時に、読み込まれた環境変数ファイル、利用可能なスキル一覧、登録された skill tools、および agent の最終応答を表示します。
+起動時に、読み込まれた環境変数ファイル、利用可能なスキル一覧、同期された Claude custom skills、生成されたスライド要約、および出力先の `.pptx` を表示します。
 
-正常系では最後に `Run summary:` と `Agent response:` が出ます。`使用された skill tools` に 1 つ以上の skill 名が出るのが成功条件です。1 つも使われなかった場合は、実装側でエラー扱いにしています。
+正常系では最後に `Run summary:` と `Slide summary:` が出ます。PowerPoint ファイルは [`output/claude-skills-deck.pptx`](/Users/yuta.okada/local/dev/agent-skills-example/output/claude-skills-deck.pptx) に出力されます。

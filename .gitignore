@@ -1,7 +1,9 @@
 node_modules/
 dist/
+output/
 
 .env*
 !.env.example
+.claude-skills-manifest.json
 
 .DS_Store

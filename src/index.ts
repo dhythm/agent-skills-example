@@ -1,147 +1,429 @@
-import { Agent, Runner } from "@openai/agents";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { createHash } from "node:crypto";
+
+import Anthropic from "@anthropic-ai/sdk";
+import { toFile } from "@anthropic-ai/sdk/uploads";
+import PptxGenJS from "pptxgenjs";
+import { z } from "zod";
 
 import { loadEnvironment } from "./loadEnv";
-import { formatSkillCatalog, loadSkillBody, loadSkills } from "./skills";
+import { formatSkillCatalog, loadSkills, type SkillDefinition } from "./skills";
 
 const loadedEnvFiles = loadEnvironment();
-const openaiApiKey = process.env.OPENAI_API_KEY;
-const openaiModel = process.env.OPENAI_MODEL ?? "gpt-5-mini";
-const runner = new Runner({ tracingDisabled: true });
-
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514";
 const sampleUserPrompt = (process.argv.slice(2).join(" ") || `
-TypeScript で OpenAI SDK と Claude SDK を使う CLI サンプルを改善してください。
-要件:
-- .env.local を優先して API キーを読む
-- README にセットアップ手順を追記する
-- 実行コマンドも整理する
+このプロジェクトが Claude Skills API を使って local skills を同期し、
+PowerPoint を生成する流れを、非エンジニアにも伝わるように
+わかりやすいスライドにまとめてください。
 `).trim();
 
+const skillsBeta = "skills-2025-10-02" as const;
+const codeExecutionBeta = "code-execution-2025-08-25" as const;
+const manifestPath = path.resolve(process.cwd(), ".claude-skills-manifest.json");
+const outputDirPath = path.resolve(process.cwd(), "output");
+const outputPptxPath = path.join(outputDirPath, "claude-skills-deck.pptx");
+
+const slideDeckSchema = z.object({
+  deckTitle: z.string().min(1),
+  subtitle: z.string().optional().default(""),
+  slides: z
+    .array(
+      z.object({
+        title: z.string().min(1),
+        bullets: z.array(z.string().min(1)).min(1).max(6),
+      }),
+    )
+    .min(3)
+    .max(8),
+});
+
+type SlideDeck = z.infer<typeof slideDeckSchema>;
+
+type ManifestEntry = {
+  hash: string;
+  skillId: string;
+  version: string;
+};
+
+type Manifest = Record<string, ManifestEntry>;
+
 async function main() {
-  if (!openaiApiKey) {
-    console.warn("OPENAI_API_KEY is not set.");
+  if (!anthropicApiKey) {
+    console.warn("ANTHROPIC_API_KEY is not set.");
   }
 
-  const skills = await loadSkills();
-  const manager = createManagerAgent(skills);
+  const allSkills = await loadSkills();
+  const projectSkills = allSkills.filter((skill) => skill.scope === "project");
 
   console.log(
     `Environment loaded from: ${
       loadedEnvFiles.length > 0 ? loadedEnvFiles.join(", ") : "no env files"
     }`,
   );
-  console.log(`OpenAI Agents client: ${openaiApiKey ? "ready" : "not configured"}`);
-  console.log(`Model: ${openaiModel}`);
-  console.log(`Loaded skills: ${skills.length}`);
-  console.log(formatSkillCatalog(skills));
+  console.log(`Anthropic client: ${anthropicApiKey ? "ready" : "not configured"}`);
+  console.log(`Model: ${anthropicModel}`);
+  console.log(`Loaded skills: ${allSkills.length}`);
+  console.log(formatSkillCatalog(allSkills));
   console.log("\nSample user prompt:");
   console.log(sampleUserPrompt);
-  console.log("\nRegistered skill tools:");
-  for (const skill of skills) {
-    console.log(`- ${skill.name}: ${skill.description}`);
-  }
 
-  if (!openaiApiKey) {
-    console.log("\nOPENAI_API_KEY が未設定のため、Agent 実行はスキップしました。");
+  if (!anthropicApiKey) {
+    console.log("\nANTHROPIC_API_KEY が未設定のため、Claude Skills 実行はスキップしました。");
     return;
   }
 
-  const result = await runner.run(manager, sampleUserPrompt);
-  const usedSkillToolNames = extractUsedSkillToolNames(result.newItems);
+  if (projectSkills.length === 0) {
+    throw new Error("project scope の skill が見つかりませんでした。");
+  }
 
-  if (usedSkillToolNames.length === 0) {
-    throw new Error(
-      "skill tool が 1 つも使われませんでした。現在の設定では少なくとも 1 つの skill を使う想定です。",
+  const client = new Anthropic({ apiKey: anthropicApiKey });
+  const syncedSkills = await syncProjectSkills(client, projectSkills);
+
+  console.log("\nSynced Claude custom skills:");
+  for (const skill of syncedSkills) {
+    console.log(`- ${skill.name}: ${skill.skillId}@${skill.version}`);
+  }
+
+  const response = await client.beta.messages.create({
+    model: anthropicModel,
+    max_tokens: 1200,
+    betas: [codeExecutionBeta, skillsBeta],
+    tools: [
+      {
+        name: "code_execution",
+        type: "code_execution_20250825",
+      },
+    ],
+    container: {
+      skills: syncedSkills.map((skill) => ({
+        type: "custom",
+        skill_id: skill.skillId,
+        version: skill.version,
+      })),
+    },
+    messages: [
+      {
+        role: "user",
+        content: buildSlidePrompt(sampleUserPrompt),
+      },
+    ],
+  });
+
+  const responseText = extractTextResponse(response);
+  const slideDeck = parseSlideDeck(responseText);
+  await writePowerPoint(slideDeck);
+
+  console.log("\nRun summary:");
+  console.log(
+    `- Claude container loaded skills: ${syncedSkills
+      .map((skill) => skill.name)
+      .join(", ")}`,
+  );
+  console.log(`- Container skill count: ${response.container?.skills?.length ?? 0}`);
+  console.log(`- PowerPoint output: ${outputPptxPath}`);
+  console.log("- 期待される状態: PowerPoint ファイルが生成され、ここに要約が表示されれば成功です");
+  console.log("\nSlide summary:");
+  console.log(`- deckTitle: ${slideDeck.deckTitle}`);
+  console.log(`- slides: ${slideDeck.slides.length}`);
+  for (const slide of slideDeck.slides) {
+    console.log(`- ${slide.title}`);
+  }
+}
+
+async function syncProjectSkills(client: Anthropic, skills: SkillDefinition[]) {
+  const manifest = await readManifest();
+  const remoteSkills = await listCustomSkills(client);
+  const updatedManifest: Manifest = {};
+  const synced: Array<{ name: string; skillId: string; version: string }> = [];
+
+  for (const skill of skills) {
+    const hash = await hashSkillDirectory(skill.path);
+    const manifestEntry = manifest[skill.name];
+
+    if (manifestEntry?.hash === hash) {
+      synced.push({
+        name: skill.name,
+        skillId: manifestEntry.skillId,
+        version: manifestEntry.version,
+      });
+      continue;
+    }
+
+    const uploadFiles = await buildSkillUploadFiles(skill.path);
+    const displayTitle = buildDisplayTitle(skill.name);
+    const remoteSkill = remoteSkills.get(displayTitle);
+
+    if (!remoteSkill) {
+      const created = await client.beta.skills.create({
+        display_title: displayTitle,
+        files: uploadFiles,
+        betas: [skillsBeta],
+      });
+
+      const version = created.latest_version ?? "latest";
+      updatedManifest[skill.name] = {
+        hash,
+        skillId: created.id,
+        version,
+      };
+      synced.push({ name: skill.name, skillId: created.id, version });
+      continue;
+    }
+
+    const createdVersion = await client.beta.skills.versions.create(remoteSkill.id, {
+      files: uploadFiles,
+      betas: [skillsBeta],
+    });
+
+    updatedManifest[skill.name] = {
+      hash,
+      skillId: remoteSkill.id,
+      version: createdVersion.version,
+    };
+    synced.push({
+      name: skill.name,
+      skillId: remoteSkill.id,
+      version: createdVersion.version,
+    });
+  }
+
+  await writeManifest(updatedManifest);
+
+  return synced;
+}
+
+async function listCustomSkills(client: Anthropic) {
+  const map = new Map<string, { id: string; latestVersion: string | null }>();
+
+  for await (const skill of client.beta.skills.list({
+    source: "custom",
+    betas: [skillsBeta],
+  })) {
+    if (!skill.display_title) {
+      continue;
+    }
+
+    map.set(skill.display_title, {
+      id: skill.id,
+      latestVersion: skill.latest_version,
+    });
+  }
+
+  return map;
+}
+
+async function buildSkillUploadFiles(skillPath: string) {
+  const skillDir = path.dirname(skillPath);
+  const rootDirName = path.basename(skillDir);
+  const filePaths = await collectFiles(skillDir);
+
+  return Promise.all(
+    filePaths.map(async (filePath) => {
+      const relativePath = path.relative(skillDir, filePath);
+      const file = await fs.readFile(filePath);
+
+      return toFile(file, path.posix.join(rootDirName, toPosixPath(relativePath)));
+    }),
+  );
+}
+
+async function collectFiles(dirPath: string): Promise<string[]> {
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const files: string[] = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+
+    if (entry.isDirectory()) {
+      files.push(...(await collectFiles(fullPath)));
+      continue;
+    }
+
+    files.push(fullPath);
+  }
+
+  return files.sort();
+}
+
+async function hashSkillDirectory(skillPath: string): Promise<string> {
+  const hash = createHash("sha256");
+  const skillDir = path.dirname(skillPath);
+  const filePaths = await collectFiles(skillDir);
+
+  for (const filePath of filePaths) {
+    hash.update(path.relative(skillDir, filePath));
+    hash.update(await fs.readFile(filePath));
+  }
+
+  return hash.digest("hex");
+}
+
+async function readManifest(): Promise<Manifest> {
+  try {
+    return JSON.parse(await fs.readFile(manifestPath, "utf8")) as Manifest;
+  } catch (error) {
+    const fsError = error as NodeJS.ErrnoException;
+    if (fsError.code === "ENOENT") {
+      return {};
+    }
+
+    throw error;
+  }
+}
+
+async function writeManifest(manifest: Manifest): Promise<void> {
+  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+}
+
+function buildDisplayTitle(skillName: string): string {
+  return `agent-skills-example/${skillName}`;
+}
+
+function toPosixPath(filePath: string): string {
+  return filePath.split(path.sep).join(path.posix.sep);
+}
+
+function extractTextResponse(response: Awaited<ReturnType<Anthropic["beta"]["messages"]["create"]>>) {
+  if (!("content" in response)) {
+    return "";
+  }
+
+  return response.content
+    .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+}
+
+function buildSlidePrompt(userPrompt: string): string {
+  return [
+    "以下の依頼に対して、日本語の PowerPoint スライド構成を作成してください。",
+    "回答は JSON のみで返してください。前置きや説明文は不要です。",
+    "形式:",
+    JSON.stringify(
+      {
+        deckTitle: "スライド全体タイトル",
+        subtitle: "任意のサブタイトル",
+        slides: [
+          {
+            title: "スライドタイトル",
+            bullets: ["箇条書き1", "箇条書き2"],
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "ルール:",
+    "- slides は 3 から 8 枚",
+    "- 各 slide の bullets は 1 から 6 個",
+    "- 箇条書きは短く、PowerPoint にそのまま載せられる文にする",
+    "- 既存プロジェクト文脈に合わない仮定は避ける",
+    "- 同期された skill の意図を反映する",
+    "",
+    "依頼:",
+    userPrompt,
+  ].join("\n");
+}
+
+function parseSlideDeck(responseText: string): SlideDeck {
+  const jsonText = extractJsonObject(responseText);
+  const parsed = JSON.parse(jsonText) as unknown;
+
+  return slideDeckSchema.parse(parsed);
+}
+
+function extractJsonObject(responseText: string): string {
+  const startIndex = responseText.indexOf("{");
+  const endIndex = responseText.lastIndexOf("}");
+
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    throw new Error("Claude response から JSON を抽出できませんでした。");
+  }
+
+  return responseText.slice(startIndex, endIndex + 1);
+}
+
+async function writePowerPoint(slideDeck: SlideDeck): Promise<void> {
+  await fs.mkdir(outputDirPath, { recursive: true });
+
+  const pptx = new PptxGenJS();
+  pptx.layout = "LAYOUT_WIDE";
+  pptx.author = "Codex";
+  pptx.company = "OpenAI";
+  pptx.subject = slideDeck.deckTitle;
+  pptx.title = slideDeck.deckTitle;
+  pptx.theme = {
+    headFontFace: "Aptos Display",
+    bodyFontFace: "Aptos",
+  };
+
+  const titleSlide = pptx.addSlide();
+  titleSlide.background = { color: "F7F4EA" };
+  titleSlide.addText(slideDeck.deckTitle, {
+    x: 0.8,
+    y: 1.1,
+    w: 11.2,
+    h: 0.8,
+    fontFace: "Aptos Display",
+    fontSize: 24,
+    bold: true,
+    color: "17324D",
+  });
+  titleSlide.addText(slideDeck.subtitle || "Claude Skills API を用いた生成結果", {
+    x: 0.8,
+    y: 2.0,
+    w: 11.2,
+    h: 0.5,
+    fontFace: "Aptos",
+    fontSize: 11,
+    color: "486581",
+  });
+
+  for (const slideData of slideDeck.slides) {
+    const slide = pptx.addSlide();
+    slide.background = { color: "FFFDF8" };
+    slide.addShape(pptx.ShapeType.rect, {
+      x: 0,
+      y: 0,
+      w: 13.33,
+      h: 0.55,
+      fill: { color: "17324D" },
+      line: { color: "17324D" },
+    });
+    slide.addText(slideData.title, {
+      x: 0.75,
+      y: 0.9,
+      w: 11.8,
+      h: 0.5,
+      fontFace: "Aptos Display",
+      fontSize: 21,
+      bold: true,
+      color: "17324D",
+    });
+    slide.addText(
+      slideData.bullets.map((bullet) => ({
+        text: bullet,
+        options: { bullet: { indent: 14 } },
+      })),
+      {
+        x: 1.0,
+        y: 1.75,
+        w: 11.3,
+        h: 4.8,
+        fontFace: "Aptos",
+        fontSize: 16,
+        color: "243B53",
+        breakLine: true,
+        paraSpaceAfter: 14,
+        valign: "top",
+      },
     );
   }
 
-  console.log("\nRun summary:");
-  console.log(`- 使用された skill tools: ${usedSkillToolNames.join(", ")}`);
-  console.log("- 期待される状態: ここに最終回答が表示されれば成功です");
-  console.log("\nAgent response:");
-  console.log(buildFinalDisplay(result.finalOutput ?? "", usedSkillToolNames));
-}
-
-function createManagerAgent(skills: Awaited<ReturnType<typeof loadSkills>>) {
-  const skillTools = skills.map((skill) => createSkillAgent(skill).asTool({
-    toolName: toToolName(skill.name),
-    toolDescription: skill.description,
-  }));
-
-  return new Agent({
-    name: "Agent Skills Manager",
-    model: openaiModel,
-    instructions: [
-      "あなたは Agent Skills を使って作業するコーディングエージェントです。",
-      "利用可能な skill tool の description を見て、依頼に関連するものを必ず少なくとも1つ使ってください。",
-      "一般知識だけで答えられそうでも、今回の実装では必ず skill tool を使ってから回答してください。",
-      "使っていない skill を使ったとは書かないでください。",
-      "最終回答では、skill 使用履歴を自称しないでください。skill 名の表示はホスト側が行います。",
-      "回答は日本語で簡潔にしてください。",
-    ].join("\n"),
-    tools: skillTools,
-    modelSettings: {
-      toolChoice: "required",
-      parallelToolCalls: true,
-    },
-  });
-}
-
-function createSkillAgent(skill: Awaited<ReturnType<typeof loadSkills>>[number]) {
-  return new Agent({
-    name: `${skill.name} specialist`,
-    model: openaiModel,
-    instructions: async () => {
-      const skillBody = await loadSkillBody(skill.path);
-
-      return [
-        `あなたは "${skill.name}" 専門のサブエージェントです。`,
-        `Skill description: ${skill.description}`,
-        "以下の skill 内容に従って、依頼に必要な部分だけを実務的に返してください。",
-        "skill に書かれていないことは断定しないでください。",
-        "回答は日本語で簡潔にしてください。",
-        "",
-        skillBody,
-      ].join("\n");
-    },
-  });
-}
-
-function toToolName(skillName: string): string {
-  const normalized = skillName
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-
-  return normalized || "skill_tool";
-}
-
-function extractUsedSkillToolNames(
-  items: Array<{ type: string; toolName?: string; name?: string }>,
-): string[] {
-  const used = new Set<string>();
-
-  for (const item of items) {
-    if (item.type !== "tool_call_item" && item.type !== "tool_call_output_item") {
-      continue;
-    }
-
-    const toolName = item.toolName ?? item.name;
-    if (!toolName) {
-      continue;
-    }
-
-    used.add(toolName);
-  }
-
-  return [...used.values()].sort();
-}
-
-function buildFinalDisplay(finalOutput: string, usedSkillToolNames: string[]): string {
-  return [
-    `使用した skill tools: ${usedSkillToolNames.join(", ")}`,
-    "",
-    finalOutput,
-  ].join("\n");
+  await pptx.writeFile({ fileName: outputPptxPath });
 }
 
 main().catch((error: unknown) => {
