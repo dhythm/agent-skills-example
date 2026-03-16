@@ -27,12 +27,10 @@ ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
 `src/index.ts` は Claude 公式 Skills API を使って動きます。
 
-1. プロジェクト内の PowerPoint 用 local skill を custom skill として Anthropic に同期する
-2. `beta.messages.create()` で `container.skills` に同期済み skill を指定する
+1. project skill として配置した `pptx` の定義を参照しつつ、Claude の built-in `pptx` skill を使う
+2. `beta.messages.create()` で `container.skills` に `pptx` を指定する
 3. `code_execution_20250825` ツールを有効にし、Claude に skill を使わせる
-4. Claude の応答を PowerPoint 用の JSON として受け取り、`.pptx` を生成する
-
-同期結果は [`.claude-skills-manifest.json`](/Users/yuta.okada/local/dev/agent-skills-example/.claude-skills-manifest.json) に保存されます。このファイルは Git 管理対象外です。
+4. Claude が `pptx` skill を使って `.pptx` を生成し、ホスト側がそのファイルを `output/` に保存する
 
 ## 実行
 
@@ -54,6 +52,6 @@ npm run dev -- "README と env の扱いを整理して"
 npm run build
 ```
 
-起動時に、読み込まれた環境変数ファイル、利用可能なスキル一覧、同期された Claude custom skills、生成されたスライド要約、および出力先の `.pptx` を表示します。
+起動時に、読み込まれた環境変数ファイル、利用可能なスキル一覧、使用する Claude skill、Claude の要約、および出力先の `.pptx` を表示します。
 
-正常系では最後に `Run summary:` と `Slide summary:` が出ます。PowerPoint ファイルは [`output/claude-skills-deck.pptx`](/Users/yuta.okada/local/dev/agent-skills-example/output/claude-skills-deck.pptx) に出力されます。
+正常系では最後に `Run summary:` と `Claude summary:` が出ます。Claude が生成した PowerPoint ファイルは `output/` 配下に保存されます。

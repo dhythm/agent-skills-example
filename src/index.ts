@@ -1,14 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
 
 import Anthropic from "@anthropic-ai/sdk";
-import { toFile } from "@anthropic-ai/sdk/uploads";
-import PptxGenJS from "pptxgenjs";
-import { z } from "zod";
+import type { BetaMessage } from "@anthropic-ai/sdk/resources/beta";
 
 import { loadEnvironment } from "./loadEnv";
-import { formatSkillCatalog, loadSkills, type SkillDefinition } from "./skills";
+import { formatSkillCatalog, loadSkills } from "./skills";
 
 const loadedEnvFiles = loadEnvironment();
 const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
@@ -19,35 +16,10 @@ PowerPoint を生成する流れを、非エンジニアにも伝わるように
 わかりやすいスライドにまとめてください。
 `).trim();
 
-const skillsBeta = "skills-2025-10-02" as const;
 const codeExecutionBeta = "code-execution-2025-08-25" as const;
-const manifestPath = path.resolve(process.cwd(), ".claude-skills-manifest.json");
+const skillsBeta = "skills-2025-10-02" as const;
+const filesApiBeta = "files-api-2025-04-14" as const;
 const outputDirPath = path.resolve(process.cwd(), "output");
-const outputPptxPath = path.join(outputDirPath, "claude-skills-deck.pptx");
-
-const slideDeckSchema = z.object({
-  deckTitle: z.string().min(1),
-  subtitle: z.string().optional().default(""),
-  slides: z
-    .array(
-      z.object({
-        title: z.string().min(1),
-        bullets: z.array(z.string().min(1)).min(1).max(6),
-      }),
-    )
-    .min(3)
-    .max(8),
-});
-
-type SlideDeck = z.infer<typeof slideDeckSchema>;
-
-type ManifestEntry = {
-  hash: string;
-  skillId: string;
-  version: string;
-};
-
-type Manifest = Record<string, ManifestEntry>;
 
 async function main() {
   if (!anthropicApiKey) {
@@ -55,7 +27,9 @@ async function main() {
   }
 
   const allSkills = await loadSkills();
-  const projectSkills = allSkills.filter((skill) => skill.scope === "project");
+  const pptxSkill = allSkills.find(
+    (skill) => skill.scope === "project" && skill.name === "pptx",
+  );
 
   console.log(
     `Environment loaded from: ${
@@ -74,222 +48,160 @@ async function main() {
     return;
   }
 
-  if (projectSkills.length === 0) {
-    throw new Error("project scope の skill が見つかりませんでした。");
+  if (!pptxSkill) {
+    throw new Error("project scope の `pptx` skill が見つかりませんでした。");
   }
 
   const client = new Anthropic({ apiKey: anthropicApiKey });
-  const syncedSkills = await syncProjectSkills(client, projectSkills);
+  console.log("\nUsing Claude built-in skill:");
+  console.log("- pptx");
 
-  console.log("\nSynced Claude custom skills:");
-  for (const skill of syncedSkills) {
-    console.log(`- ${skill.name}: ${skill.skillId}@${skill.version}`);
+  const response = await runUntilPptxGenerated(client, sampleUserPrompt);
+
+  const downloadedFiles = await downloadGeneratedFiles(client, response);
+  const responseText = extractTextResponse(response);
+
+  console.log("\nRun summary:");
+  console.log("- Claude container loaded skills: pptx");
+  console.log(`- Container skill count: ${response.container?.skills?.length ?? 0}`);
+  if (downloadedFiles.length === 0) {
+    console.log(`- stop_reason: ${response.stop_reason}`);
+    console.log(`- content block types: ${response.content.map((block) => block.type).join(", ")}`);
+    throw new Error(
+      "Claude の応答に PowerPoint ファイルが含まれていませんでした。text のみ返している可能性があります。",
+    );
+  }
+  console.log(`- Downloaded files: ${downloadedFiles.join(", ")}`);
+  console.log("- 期待される状態: output 配下に .pptx が生成され、ここに要約が表示されれば成功です");
+  console.log("\nClaude summary:");
+  console.log(responseText || "(text summary not returned)");
+}
+
+async function downloadGeneratedFiles(
+  client: Anthropic,
+  response: BetaMessage,
+): Promise<string[]> {
+  await fs.mkdir(outputDirPath, { recursive: true });
+  const fileIds = extractFileIds(response);
+
+  const downloadedPaths: string[] = [];
+
+  for (const fileId of fileIds) {
+    const metadata = await client.beta.files.retrieveMetadata(fileId, {
+      betas: [filesApiBeta],
+    });
+    const download = await client.beta.files.download(fileId, {
+      betas: [filesApiBeta],
+    });
+    const arrayBuffer = await download.arrayBuffer();
+    const filePath = path.join(outputDirPath, metadata.filename);
+
+    await fs.writeFile(filePath, Buffer.from(arrayBuffer));
+    downloadedPaths.push(filePath);
   }
 
-  const response = await client.beta.messages.create({
+  return downloadedPaths;
+}
+
+async function runUntilPptxGenerated(
+  client: Anthropic,
+  userPrompt: string,
+): Promise<BetaMessage> {
+  let container: { id?: string | null; skills?: Array<{ type: "anthropic"; skill_id: "pptx"; version: "latest" }> } | string = {
+    skills: [
+      {
+        type: "anthropic",
+        skill_id: "pptx",
+        version: "latest",
+      },
+    ],
+  };
+
+  let response = await client.beta.messages.create({
     model: anthropicModel,
-    max_tokens: 1200,
-    betas: [codeExecutionBeta, skillsBeta],
+    max_tokens: 4096,
+    stream: false,
+    betas: [codeExecutionBeta, skillsBeta, filesApiBeta],
+    tool_choice: {
+      type: "any",
+      disable_parallel_tool_use: true,
+    },
     tools: [
       {
         name: "code_execution",
         type: "code_execution_20250825",
       },
     ],
-    container: {
-      skills: syncedSkills.map((skill) => ({
-        type: "custom",
-        skill_id: skill.skillId,
-        version: skill.version,
-      })),
-    },
+    container,
+    system: [
+      {
+        type: "text",
+        text: [
+          "You must use the pptx skill and code execution to generate a real .pptx file.",
+          "Do not stop at an outline or draft.",
+          "Your task is incomplete unless the final response includes at least one generated PowerPoint file.",
+        ].join(" "),
+      },
+    ],
     messages: [
       {
         role: "user",
-        content: buildSlidePrompt(sampleUserPrompt),
+        content: buildSlidePrompt(userPrompt),
       },
     ],
   });
 
-  const responseText = extractTextResponse(response);
-  const slideDeck = parseSlideDeck(responseText);
-  await writePowerPoint(slideDeck);
-
-  console.log("\nRun summary:");
-  console.log(
-    `- Claude container loaded skills: ${syncedSkills
-      .map((skill) => skill.name)
-      .join(", ")}`,
-  );
-  console.log(`- Container skill count: ${response.container?.skills?.length ?? 0}`);
-  console.log(`- PowerPoint output: ${outputPptxPath}`);
-  console.log("- 期待される状態: PowerPoint ファイルが生成され、ここに要約が表示されれば成功です");
-  console.log("\nSlide summary:");
-  console.log(`- deckTitle: ${slideDeck.deckTitle}`);
-  console.log(`- slides: ${slideDeck.slides.length}`);
-  for (const slide of slideDeck.slides) {
-    console.log(`- ${slide.title}`);
-  }
-}
-
-async function syncProjectSkills(client: Anthropic, skills: SkillDefinition[]) {
-  const manifest = await readManifest();
-  const remoteSkills = await listCustomSkills(client);
-  const updatedManifest: Manifest = {};
-  const synced: Array<{ name: string; skillId: string; version: string }> = [];
-
-  for (const skill of skills) {
-    const hash = await hashSkillDirectory(skill.path);
-    const manifestEntry = manifest[skill.name];
-
-    if (manifestEntry?.hash === hash) {
-      synced.push({
-        name: skill.name,
-        skillId: manifestEntry.skillId,
-        version: manifestEntry.version,
-      });
-      continue;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const fileIds = extractFileIds(response);
+    if (fileIds.length > 0) {
+      return response;
     }
 
-    const uploadFiles = await buildSkillUploadFiles(skill.path);
-    const displayTitle = buildDisplayTitle(skill.name);
-    const remoteSkill = remoteSkills.get(displayTitle);
-
-    if (!remoteSkill) {
-      const created = await client.beta.skills.create({
-        display_title: displayTitle,
-        files: uploadFiles,
-        betas: [skillsBeta],
-      });
-
-      const version = created.latest_version ?? "latest";
-      updatedManifest[skill.name] = {
-        hash,
-        skillId: created.id,
-        version,
-      };
-      synced.push({ name: skill.name, skillId: created.id, version });
-      continue;
+    if (response.stop_reason !== "max_tokens" || !response.container?.id) {
+      return response;
     }
 
-    const createdVersion = await client.beta.skills.versions.create(remoteSkill.id, {
-      files: uploadFiles,
-      betas: [skillsBeta],
-    });
-
-    updatedManifest[skill.name] = {
-      hash,
-      skillId: remoteSkill.id,
-      version: createdVersion.version,
-    };
-    synced.push({
-      name: skill.name,
-      skillId: remoteSkill.id,
-      version: createdVersion.version,
+    container = response.container.id;
+    response = await client.beta.messages.create({
+      model: anthropicModel,
+      max_tokens: 4096,
+      stream: false,
+      betas: [codeExecutionBeta, skillsBeta, filesApiBeta],
+      tool_choice: {
+        type: "any",
+        disable_parallel_tool_use: true,
+      },
+      tools: [
+        {
+          name: "code_execution",
+          type: "code_execution_20250825",
+        },
+      ],
+      container,
+      system: [
+        {
+          type: "text",
+          text: [
+            "Continue from the current container state.",
+            "Finish the PowerPoint and include the generated .pptx file in the final response.",
+            "Do not restart from scratch.",
+          ].join(" "),
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content:
+            "続けてください。必ず `.pptx` ファイルを生成し、最終レスポンスに添付してください。",
+        },
+      ],
     });
   }
 
-  await writeManifest(updatedManifest);
-
-  return synced;
+  return response;
 }
 
-async function listCustomSkills(client: Anthropic) {
-  const map = new Map<string, { id: string; latestVersion: string | null }>();
-
-  for await (const skill of client.beta.skills.list({
-    source: "custom",
-    betas: [skillsBeta],
-  })) {
-    if (!skill.display_title) {
-      continue;
-    }
-
-    map.set(skill.display_title, {
-      id: skill.id,
-      latestVersion: skill.latest_version,
-    });
-  }
-
-  return map;
-}
-
-async function buildSkillUploadFiles(skillPath: string) {
-  const skillDir = path.dirname(skillPath);
-  const rootDirName = path.basename(skillDir);
-  const filePaths = await collectFiles(skillDir);
-
-  return Promise.all(
-    filePaths.map(async (filePath) => {
-      const relativePath = path.relative(skillDir, filePath);
-      const file = await fs.readFile(filePath);
-
-      return toFile(file, path.posix.join(rootDirName, toPosixPath(relativePath)));
-    }),
-  );
-}
-
-async function collectFiles(dirPath: string): Promise<string[]> {
-  const entries = await fs.readdir(dirPath, { withFileTypes: true });
-  const files: string[] = [];
-
-  for (const entry of entries) {
-    const fullPath = path.join(dirPath, entry.name);
-
-    if (entry.isDirectory()) {
-      files.push(...(await collectFiles(fullPath)));
-      continue;
-    }
-
-    files.push(fullPath);
-  }
-
-  return files.sort();
-}
-
-async function hashSkillDirectory(skillPath: string): Promise<string> {
-  const hash = createHash("sha256");
-  const skillDir = path.dirname(skillPath);
-  const filePaths = await collectFiles(skillDir);
-
-  for (const filePath of filePaths) {
-    hash.update(path.relative(skillDir, filePath));
-    hash.update(await fs.readFile(filePath));
-  }
-
-  return hash.digest("hex");
-}
-
-async function readManifest(): Promise<Manifest> {
-  try {
-    return JSON.parse(await fs.readFile(manifestPath, "utf8")) as Manifest;
-  } catch (error) {
-    const fsError = error as NodeJS.ErrnoException;
-    if (fsError.code === "ENOENT") {
-      return {};
-    }
-
-    throw error;
-  }
-}
-
-async function writeManifest(manifest: Manifest): Promise<void> {
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
-}
-
-function buildDisplayTitle(skillName: string): string {
-  return `agent-skills-example/${skillName}`;
-}
-
-function toPosixPath(filePath: string): string {
-  return filePath.split(path.sep).join(path.posix.sep);
-}
-
-function extractTextResponse(response: Awaited<ReturnType<Anthropic["beta"]["messages"]["create"]>>) {
-  if (!("content" in response)) {
-    return "";
-  }
-
+function extractTextResponse(response: BetaMessage) {
   return response.content
     .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
     .map((block) => block.text)
@@ -299,131 +211,59 @@ function extractTextResponse(response: Awaited<ReturnType<Anthropic["beta"]["mes
 
 function buildSlidePrompt(userPrompt: string): string {
   return [
-    "以下の依頼に対して、日本語の PowerPoint スライド構成を作成してください。",
-    "回答は JSON のみで返してください。前置きや説明文は不要です。",
-    "形式:",
-    JSON.stringify(
-      {
-        deckTitle: "スライド全体タイトル",
-        subtitle: "任意のサブタイトル",
-        slides: [
-          {
-            title: "スライドタイトル",
-            bullets: ["箇条書き1", "箇条書き2"],
-          },
-        ],
-      },
-      null,
-      2,
-    ),
-    "ルール:",
-    "- slides は 3 から 8 枚",
-    "- 各 slide の bullets は 1 から 6 個",
-    "- 箇条書きは短く、PowerPoint にそのまま載せられる文にする",
-    "- 既存プロジェクト文脈に合わない仮定は避ける",
-    "- 同期された skill の意図を反映する",
+    "以下の依頼に対して、pptx skill を使って .pptx ファイルを作成してください。",
+    "最終的な成果物は PowerPoint ファイルそのものです。",
+    "テキストだけで終わらず、必ず .pptx を生成して最終レスポンスに含めてください。",
+    "ファイル名は `claude-skills-deck.pptx` にしてください。",
+    "PowerPoint ファイルを生成できない場合は、その理由を短く説明してください。",
+    "説明文は短くて構いませんが、ファイル生成を優先してください。",
+    "非エンジニアにも伝わる、見やすく実務的なスライドにしてください。",
+    "今回の題材は営業資料ではありません。このリポジトリの仕組み説明資料です。",
+    "営業戦略、一般的な会社紹介、新製品提案のような無関係な内容は作らないでください。",
+    "スライド内容は必ず以下の要素を含めてください。",
+    "- Claude Skills API を使うこと",
+    "- local skills を project 内に置いていること",
+    "- built-in `pptx` skill を container.skills で使うこと",
+    "- code execution により .pptx を生成すること",
+    "- 生成された .pptx を output/ に保存すること",
+    "対象読者は非エンジニアなので、専門用語は短く説明してください。",
+    "スライドは 5 から 8 枚程度にしてください。",
     "",
     "依頼:",
     userPrompt,
   ].join("\n");
 }
 
-function parseSlideDeck(responseText: string): SlideDeck {
-  const jsonText = extractJsonObject(responseText);
-  const parsed = JSON.parse(jsonText) as unknown;
+function extractFileIds(
+  response: BetaMessage,
+): string[] {
+  const fileIds = new Set<string>();
 
-  return slideDeckSchema.parse(parsed);
-}
+  for (const block of response.content as unknown as Array<Record<string, unknown>>) {
+    if (block.type === "container_upload" && typeof block.file_id === "string") {
+      fileIds.add(block.file_id);
+      continue;
+    }
 
-function extractJsonObject(responseText: string): string {
-  const startIndex = responseText.indexOf("{");
-  const endIndex = responseText.lastIndexOf("}");
+    if (block.type !== "bash_code_execution_tool_result") {
+      continue;
+    }
 
-  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
-    throw new Error("Claude response から JSON を抽出できませんでした。");
+    const content = block.content as Record<string, unknown> | undefined;
+    if (!content || content.type !== "bash_code_execution_result") {
+      continue;
+    }
+
+    const outputs = Array.isArray(content.content) ? content.content : [];
+    for (const output of outputs) {
+      const item = output as Record<string, unknown>;
+      if (typeof item.file_id === "string") {
+        fileIds.add(item.file_id);
+      }
+    }
   }
 
-  return responseText.slice(startIndex, endIndex + 1);
-}
-
-async function writePowerPoint(slideDeck: SlideDeck): Promise<void> {
-  await fs.mkdir(outputDirPath, { recursive: true });
-
-  const pptx = new PptxGenJS();
-  pptx.layout = "LAYOUT_WIDE";
-  pptx.author = "Codex";
-  pptx.company = "OpenAI";
-  pptx.subject = slideDeck.deckTitle;
-  pptx.title = slideDeck.deckTitle;
-  pptx.theme = {
-    headFontFace: "Aptos Display",
-    bodyFontFace: "Aptos",
-  };
-
-  const titleSlide = pptx.addSlide();
-  titleSlide.background = { color: "F7F4EA" };
-  titleSlide.addText(slideDeck.deckTitle, {
-    x: 0.8,
-    y: 1.1,
-    w: 11.2,
-    h: 0.8,
-    fontFace: "Aptos Display",
-    fontSize: 24,
-    bold: true,
-    color: "17324D",
-  });
-  titleSlide.addText(slideDeck.subtitle || "Claude Skills API を用いた生成結果", {
-    x: 0.8,
-    y: 2.0,
-    w: 11.2,
-    h: 0.5,
-    fontFace: "Aptos",
-    fontSize: 11,
-    color: "486581",
-  });
-
-  for (const slideData of slideDeck.slides) {
-    const slide = pptx.addSlide();
-    slide.background = { color: "FFFDF8" };
-    slide.addShape(pptx.ShapeType.rect, {
-      x: 0,
-      y: 0,
-      w: 13.33,
-      h: 0.55,
-      fill: { color: "17324D" },
-      line: { color: "17324D" },
-    });
-    slide.addText(slideData.title, {
-      x: 0.75,
-      y: 0.9,
-      w: 11.8,
-      h: 0.5,
-      fontFace: "Aptos Display",
-      fontSize: 21,
-      bold: true,
-      color: "17324D",
-    });
-    slide.addText(
-      slideData.bullets.map((bullet) => ({
-        text: bullet,
-        options: { bullet: { indent: 14 } },
-      })),
-      {
-        x: 1.0,
-        y: 1.75,
-        w: 11.3,
-        h: 4.8,
-        fontFace: "Aptos",
-        fontSize: 16,
-        color: "243B53",
-        breakLine: true,
-        paraSpaceAfter: 14,
-        valign: "top",
-      },
-    );
-  }
-
-  await pptx.writeFile({ fileName: outputPptxPath });
+  return [...fileIds.values()];
 }
 
 main().catch((error: unknown) => {
