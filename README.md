@@ -42,6 +42,10 @@ ANTHROPIC_API_KEY=your_anthropic_api_key
 
 `local` モードでは `.agents/skills/pptx` 配下のファイルを `pptx/...` の相対パスでアップロードします。同期済みの custom skill ID / version は `.claude-skills-manifest.json` に保存され、内容が変わらない限り再アップロードしません。
 
+利用している Claude 系スキルの参照元:
+
+- `pptx`: https://github.com/anthropics/skills/tree/main/skills/pptx
+
 ### OpenAI
 
 1. `--provider=openai` を指定する
@@ -50,6 +54,10 @@ ANTHROPIC_API_KEY=your_anthropic_api_key
 4. container 内の生成物を取得し、ホスト側の `output/` に保存する
 
 OpenAI 用の `slides` skill には、OpenAI 公式の curated skill を同梱しています。
+
+利用している OpenAI 系スキルの参照元:
+
+- `slides`: https://github.com/openai/skills/tree/main/skills/.curated/slides
 
 ## 実行
 
