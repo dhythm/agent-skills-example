@@ -508,11 +508,13 @@ async function runUntilPptxGenerated(
 
 async function buildOpenAiInlineSkill(skill: SkillDefinition): Promise<Responses.InlineSkill> {
   const skillDir = path.dirname(skill.path);
+  const parentDir = path.dirname(skillDir);
+  const topLevelDir = path.basename(skillDir);
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openai-skill-"));
   const zipPath = path.join(tempDir, `${skill.name}.zip`);
 
   try {
-    await execFile("zip", ["-rq", zipPath, "."], { cwd: skillDir });
+    await execFile("zip", ["-rq", zipPath, topLevelDir], { cwd: parentDir });
     const bundle = await fs.readFile(zipPath);
 
     return {
@@ -539,9 +541,9 @@ async function runUntilOpenAiDeckGenerated(
   userPrompt: string,
   skill: Responses.InlineSkill,
 ): Promise<Response> {
-  return client.responses.create({
+  let response = await client.responses.create({
     model: openaiModel,
-    max_output_tokens: 4096,
+    max_output_tokens: 8192,
     input: [
       {
         role: "system",
@@ -567,6 +569,40 @@ async function runUntilOpenAiDeckGenerated(
       },
     ],
   });
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (response.status === "completed") {
+      return response;
+    }
+
+    if (response.status !== "incomplete" || response.incomplete_details?.reason !== "max_output_tokens") {
+      return response;
+    }
+
+    response = await client.responses.create({
+      model: openaiModel,
+      max_output_tokens: 8192,
+      previous_response_id: response.id,
+      input: [
+        {
+          role: "user",
+          content:
+            "続けてください。slides skill と shell を使い、`/mnt/data/openai-skills-deck.pptx` と `/mnt/data/openai-skills-deck.js` を必ず完成させてください。",
+        },
+      ],
+      tools: [
+        {
+          type: "shell",
+          environment: {
+            type: "container_auto",
+            skills: [skill],
+          },
+        },
+      ],
+    });
+  }
+
+  return response;
 }
 
 async function downloadOpenAiGeneratedFiles(
